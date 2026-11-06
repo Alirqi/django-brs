@@ -106,7 +106,8 @@ def bookings(request):
         "source_r": bus.source,
         "dest_r": bus.dest,
         "nos_r": seats,
-        "price_r": total_cost,
+        "price_r": bus.price,
+        "cost": total_cost,
         "date_r": bus.date,
         "time_r": bus.time,
     })
