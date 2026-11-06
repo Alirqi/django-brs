@@ -1,167 +1,209 @@
 from datetime import datetime
-from django.contrib import messages
-from django.shortcuts import render
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
-# Create your views here.
-from django.shortcuts import render, redirect
-from django.http import HttpResponse, HttpResponseRedirect
-from .models import User, Bus, Book
+from django.contrib import messages
 from django.contrib.auth import authenticate, login, logout
-from django.contrib.auth.models import User
-from .forms import UserLoginForm, UserRegisterForm
 from django.contrib.auth.decorators import login_required
-from decimal import Decimal
+from django.contrib.auth.models import User
+from django.db import transaction
+from django.shortcuts import get_object_or_404, redirect, render
+
+from .models import Book, Bus
 
 
 def home(request):
     if request.user.is_authenticated:
-        return render(request, 'myapp/home.html')
-    else:
-        return render(request, 'myapp/signin.html')
+        return render(request, "myapp/home.html")
+    return redirect("signin")
 
 
-@login_required(login_url='signin')
+@login_required(login_url="signin")
 def findbus(request):
-    context = {}
-    if request.method == 'POST':
-        source_r = request.POST.get('source')
-        dest_r = request.POST.get('destination')
-        date_r = request.POST.get('date')
-        date_r = datetime.strptime(date_r,"%Y-%m-%d").date()
-        year = date_r.strftime("%Y")
-        month = date_r.strftime("%m")
-        day = date_r.strftime("%d")
-        bus_list = Bus.objects.filter(source=source_r, dest=dest_r, date__year=year, date__month=month, date__day=day)
-        if bus_list:
-            return render(request, 'myapp/list.html', locals())
-        else:
-            context['data'] = request.POST
-            context["error"] = "No available Bus Schedule for entered Route and Date"
-            return render(request, 'myapp/findbus.html', context)
-    else:
-        return render(request, 'myapp/findbus.html')
+    if request.method != "POST":
+        return render(request, "myapp/findbus.html")
+
+    source = (request.POST.get("source") or "").strip()
+    destination = (request.POST.get("destination") or "").strip()
+    date_value = request.POST.get("date") or ""
+
+    try:
+        travel_date = datetime.strptime(date_value, "%Y-%m-%d").date()
+    except ValueError:
+        return render(request, "myapp/findbus.html", {
+            "data": request.POST,
+            "error": "Please enter a valid travel date.",
+        })
+
+    bus_list = Bus.objects.filter(
+        source__iexact=source,
+        dest__iexact=destination,
+        date=travel_date,
+        rem__gt=0,
+    ).order_by("time")
+
+    if bus_list.exists():
+        return render(request, "myapp/list.html", {
+            "bus_list": bus_list,
+            "source_r": source,
+            "dest_r": destination,
+            "date_r": travel_date,
+        })
+
+    return render(request, "myapp/findbus.html", {
+        "data": request.POST,
+        "error": "No available bus schedule for the selected route and date.",
+    })
 
 
-@login_required(login_url='signin')
+@login_required(login_url="signin")
 def bookings(request):
-    context = {}
-    if request.method == 'POST':
-        id_r = request.POST.get('bus_id')
-        seats_r = int(request.POST.get('no_seats'))
-        bus = Bus.objects.get(id=id_r)
-        if bus:
-            if bus.rem > int(seats_r):
-                name_r = bus.bus_name
-                cost = int(seats_r) * bus.price
-                source_r = bus.source
-                dest_r = bus.dest
-                nos_r = Decimal(bus.nos)
-                price_r = bus.price
-                date_r = bus.date
-                time_r = bus.time
-                username_r = request.user.username
-                email_r = request.user.email
-                userid_r = request.user.id
-                rem_r = bus.rem - seats_r
-                Bus.objects.filter(id=id_r).update(rem=rem_r)
-                book = Book.objects.create(name=username_r, email=email_r, userid=userid_r, bus_name=name_r,
-                                           source=source_r, busid=id_r,
-                                           dest=dest_r, price=price_r, nos=seats_r, date=date_r, time=time_r,
-                                           status='BOOKED')
-                print('------------book id-----------', book.id)
-                # book.save()
-                return render(request, 'myapp/bookings.html', locals())
-            else:
-                context["error"] = "Sorry select fewer number of seats"
-                return render(request, 'myapp/findbus.html', context)
+    if request.method != "POST":
+        return redirect("findbus")
 
-    else:
-        return render(request, 'myapp/findbus.html')
+    try:
+        bus_id = int(request.POST.get("bus_id", ""))
+        seats = int(request.POST.get("no_seats", ""))
+    except (TypeError, ValueError):
+        return render(request, "myapp/error.html", {
+            "error": "Please select a valid bus and number of seats.",
+        })
+
+    if seats < 1:
+        return render(request, "myapp/error.html", {
+            "error": "The number of seats must be at least one.",
+        })
+
+    with transaction.atomic():
+        bus = get_object_or_404(Bus.objects.select_for_update(), pk=bus_id)
+        if seats > bus.rem:
+            return render(request, "myapp/findbus.html", {
+                "error": "Not enough seats are available. Please choose fewer seats.",
+            })
+
+        bus.rem -= seats
+        bus.save(update_fields=["rem"])
+
+        total_cost = Decimal(seats) * bus.price
+        booking = Book.objects.create(
+            name=request.user.username,
+            email=request.user.email,
+            userid=request.user.pk,
+            busid=bus.pk,
+            bus_name=bus.bus_name,
+            source=bus.source,
+            dest=bus.dest,
+            nos=seats,
+            price=total_cost,
+            date=bus.date,
+            time=bus.time,
+            status=Book.BOOKED,
+        )
+
+    return render(request, "myapp/bookings.html", {
+        "book": booking,
+        "bus": bus,
+        "name_r": bus.bus_name,
+        "source_r": bus.source,
+        "dest_r": bus.dest,
+        "nos_r": seats,
+        "price_r": total_cost,
+        "date_r": bus.date,
+        "time_r": bus.time,
+    })
 
 
-@login_required(login_url='signin')
+@login_required(login_url="signin")
 def cancellings(request):
-    context = {}
-    if request.method == 'POST':
-        id_r = request.POST.get('bus_id')
-        #seats_r = int(request.POST.get('no_seats'))
+    if request.method != "POST":
+        return redirect("seebookings")
 
-        try:
-            book = Book.objects.get(id=id_r)
-            bus = Bus.objects.get(id=book.busid)
-            rem_r = bus.rem + book.nos
-            Bus.objects.filter(id=book.busid).update(rem=rem_r)
-            #nos_r = book.nos - seats_r
-            Book.objects.filter(id=id_r).update(status='CANCELLED')
-            Book.objects.filter(id=id_r).update(nos=0)
-            messages.success(request, "Booked Bus has been cancelled successfully.")
-            return redirect(seebookings)
-        except Book.DoesNotExist:
-            context["error"] = "Sorry You have not booked that bus"
-            return render(request, 'myapp/error.html', context)
-    else:
-        return render(request, 'myapp/findbus.html')
+    try:
+        booking_id = int(request.POST.get("bus_id", ""))
+    except (TypeError, ValueError):
+        return render(request, "myapp/error.html", {
+            "error": "Please select a valid booking.",
+        })
+
+    with transaction.atomic():
+        booking = get_object_or_404(
+            Book.objects.select_for_update(),
+            pk=booking_id,
+            userid=request.user.pk,
+        )
+
+        if booking.status == Book.CANCELLED:
+            messages.info(request, "This booking has already been cancelled.")
+            return redirect("seebookings")
+
+        bus = get_object_or_404(Bus.objects.select_for_update(), pk=booking.busid)
+        bus.rem = min(bus.nos, bus.rem + booking.nos)
+        bus.save(update_fields=["rem"])
+
+        booking.status = Book.CANCELLED
+        booking.save(update_fields=["status"])
+
+    messages.success(request, "Your booking has been cancelled successfully.")
+    return redirect("seebookings")
 
 
-@login_required(login_url='signin')
-def seebookings(request,new={}):
-    context = {}
-    id_r = request.user.id
-    book_list = Book.objects.filter(userid=id_r)
-    if book_list:
-        return render(request, 'myapp/booklist.html', locals())
-    else:
-        context["error"] = "Sorry no buses booked"
-        return render(request, 'myapp/findbus.html', context)
+@login_required(login_url="signin")
+def seebookings(request, new=None):
+    book_list = Book.objects.filter(userid=request.user.pk).order_by("-date", "-time")
+    return render(request, "myapp/booklist.html", {"book_list": book_list})
 
 
 def signup(request):
-    context = {}
-    if request.method == 'POST':
-        name_r = request.POST.get('name')
-        email_r = request.POST.get('email')
-        password_r = request.POST.get('password')
-        user = User.objects.create_user(name_r, email_r, password_r, )
-        if user:
-            login(request, user)
-            return render(request, 'myapp/thank.html')
-        else:
-            context["error"] = "Provide valid credentials"
-            return render(request, 'myapp/signup.html', context)
-    else:
-        return render(request, 'myapp/signup.html', context)
+    if request.method != "POST":
+        return render(request, "myapp/signup.html")
+
+    username = (request.POST.get("name") or "").strip()
+    email = (request.POST.get("email") or "").strip()
+    password = request.POST.get("password") or ""
+
+    if not username or not email or not password:
+        return render(request, "myapp/signup.html", {
+            "error": "Please complete all fields.",
+        })
+    if User.objects.filter(username=username).exists():
+        return render(request, "myapp/signup.html", {
+            "error": "This username is already registered.",
+        })
+    if User.objects.filter(email__iexact=email).exists():
+        return render(request, "myapp/signup.html", {
+            "error": "This email is already registered.",
+        })
+
+    user = User.objects.create_user(username=username, email=email, password=password)
+    login(request, user)
+    return render(request, "myapp/thank.html")
 
 
 def signin(request):
-    context = {}
-    if request.method == 'POST':
-        name_r = request.POST.get('name')
-        password_r = request.POST.get('password')
-        user = authenticate(request, username=name_r, password=password_r)
-        if user:
-            login(request, user)
-            # username = request.session['username']
-            context["user"] = name_r
-            context["id"] = request.user.id
-            return render(request, 'myapp/success.html', context)
-            # return HttpResponseRedirect('success')
-        else:
-            context["error"] = "Provide valid credentials"
-            return render(request, 'myapp/signin.html', context)
-    else:
-        context["error"] = "You are not logged in"
-        return render(request, 'myapp/signin.html', context)
+    if request.method != "POST":
+        return render(request, "myapp/signin.html")
+
+    username = (request.POST.get("name") or "").strip()
+    password = request.POST.get("password") or ""
+    user = authenticate(request, username=username, password=password)
+
+    if user is None:
+        return render(request, "myapp/signin.html", {
+            "error": "Invalid username or password.",
+        })
+
+    login(request, user)
+    return redirect("success")
 
 
+@login_required(login_url="signin")
 def signout(request):
-    context = {}
+    if request.method != "POST":
+        return redirect("home")
     logout(request)
-    context['error'] = "You have been logged out"
-    return render(request, 'myapp/signin.html', context)
+    messages.info(request, "You have been logged out.")
+    return redirect("signin")
 
 
+@login_required(login_url="signin")
 def success(request):
-    context = {}
-    context['user'] = request.user
-    return render(request, 'myapp/success.html', context)
+    return render(request, "myapp/success.html", {"user": request.user})
